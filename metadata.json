@@ -1,0 +1,8 @@
+{
+  "name": "Super Scan",
+  "description": "Super Scan - نظام المسح الذكي والرؤية الحاسوبية لتوليد الموسيقى التفاعلية بالذكاء الاصطناعي.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": []
+}
