@@ -1,26 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { GoogleGenAI } from '@google/genai';
-import { Camera, Square, Play, Music, Loader2, AlertCircle, Activity, Cpu, ScanFace, Info, X, Sparkles, Volume2 } from 'lucide-react';
+import { Camera, Square, Play, Loader2, AlertCircle, Activity, Cpu, ScanFace, Info, X, Sparkles, Eye } from 'lucide-react';
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import { motion, AnimatePresence } from 'motion/react';
-import * as Tone from 'tone';
-
-let hoverSynth: Tone.Synth | null = null;
-
-async function initAudio() {
-  if (Tone.context.state !== 'running') {
-    await Tone.start().catch(() => {});
-  }
-  if (!hoverSynth) {
-    hoverSynth = new Tone.Synth({
-      oscillator: { type: 'sine' },
-      envelope: { attack: 0.01, decay: 0.1, sustain: 0, release: 0.01 }
-    }).toDestination();
-    hoverSynth.volume.value = -15;
-  }
-}
 
 declare global {
   interface Window {
@@ -139,339 +123,38 @@ const EMOTION_TRANSLATIONS: Record<string, string> = {
   disgust: 'مشمئز / منزعج',
 };
 
-// قاموس الترجمة الوصفية للأجواء الموسيقية
-const VIBE_TRANSLATIONS: Record<string, string> = {
-  'minimalist ambient drone, quiet': 'طنين صوتي محيطي هادئ وبسيط',
-  'ethereal ambient drone, calm': 'أجواء أثيرية محيطية، هدوء تام',
-  'cyberpunk synthwave, electronic': 'موسيقى سينث سايبورغ، إلكترونية مستقبلية',
-  'coffee shop jazz, chill acoustic': 'موسيقى جاز دافئة، نغمات صوتية مسترخية',
-  'playful acoustic guitar, happy melody': 'غيتار مرح بألحان متفائلة ومبهجة',
-  'classical piano, focused': 'بيانو كلاسيكي للتركيز العميق والصفاء',
-  'ambient drone, relaxing': 'أصوات محيطية للاسترخاء والراحة النفسية',
-  'ethereal flute, ambient nature': 'ناي أثيري وألحان مستوحاة من الطبيعة',
-  'driving rock beat, fast tempo': 'إيقاع سريع وحيوي مفعم بالطاقة',
-  'chill lofi beat': 'إيقاعات لوفاي مريحة للأعصاب',
-};
-
-class PCMPlayer {
-  audioContext: AudioContext;
-  nextStartTime: number;
-
-  constructor(sampleRate: number = 48000) {
-    this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate });
-    this.nextStartTime = this.audioContext.currentTime;
+function getLocalSceneDescription(objects: string[], emotion: string): string {
+  if (objects.length === 0) {
+    return 'مشهد هادئ، في انتظار رصد عناصر أو أشخاص في نطاق الكاميرا.';
   }
-
-  playChunk(base64Data: string) {
-    const binaryString = atob(base64Data);
-    const len = binaryString.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    
-    // 16-bit PCM stereo
-    const int16Array = new Int16Array(bytes.buffer);
-    const numSamples = int16Array.length / 2;
-    const leftChannel = new Float32Array(numSamples);
-    const rightChannel = new Float32Array(numSamples);
-    
-    for (let i = 0; i < numSamples; i++) {
-      leftChannel[i] = int16Array[i * 2] / 32768.0;
-      rightChannel[i] = int16Array[i * 2 + 1] / 32768.0;
-    }
-
-    const audioBuffer = this.audioContext.createBuffer(2, numSamples, this.audioContext.sampleRate);
-    audioBuffer.getChannelData(0).set(leftChannel);
-    audioBuffer.getChannelData(1).set(rightChannel);
-
-    const source = this.audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(this.audioContext.destination);
-
-    const currentTime = this.audioContext.currentTime;
-    if (this.nextStartTime < currentTime) {
-      this.nextStartTime = currentTime + 0.05;
-    }
-
-    source.start(this.nextStartTime);
-    this.nextStartTime += audioBuffer.duration;
-  }
-
-  stop() {
-    if (this.audioContext.state !== 'closed') {
-      this.audioContext.close();
-    }
-  }
+  const arabicObjs = objects.map(o => OBJECT_TRANSLATIONS[o] || o).slice(0, 3).join('، ');
+  const emotionText = EMOTION_TRANSLATIONS[emotion] || emotion;
+  return `بيئة تفاعلية تحتوي على: ${arabicObjs} | الحالة التعبيرية: ${emotionText}.`;
 }
 
-class ProceduralMusicEngine {
-  audioContext: AudioContext;
-  isPlaying: boolean = false;
-  currentVibe: string = 'minimalist ambient drone, quiet';
-  targetVibe: string = 'minimalist ambient drone, quiet';
-  vibeBlend: number = 1.0;
-  nextNoteTime: number = 0;
-  timerID: number | null = null;
-  
-  // Scales (intervals from root)
-  scales: Record<string, number[]> = {
-    major: [0, 2, 4, 5, 7, 9, 11],
-    minor: [0, 2, 3, 5, 7, 8, 10],
-    pentatonic: [0, 2, 4, 7, 9],
-    cyberpunk: [0, 3, 7, 8, 10],
-    drone: [0, 7],
-    melancholic: [0, 2, 3, 7, 8],
-    dissonant: [0, 1, 6, 7, 11],
-    tribal: [0, 3, 5, 7, 10]
-  };
-
-  constructor() {
-    this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-  }
-
-  setVibe(vibe: string) {
-    if (this.targetVibe !== vibe) {
-      if (this.vibeBlend >= 1.0) {
-        this.currentVibe = this.targetVibe;
-      }
-      this.targetVibe = vibe;
-      this.vibeBlend = 0.0;
-    }
-  }
-
-  start() {
-    if (this.audioContext.state === 'suspended') {
-      this.audioContext.resume();
-    }
-    this.isPlaying = true;
-    this.nextNoteTime = this.audioContext.currentTime + 0.1;
-    this.scheduleNext();
-  }
-
-  stop() {
-    this.isPlaying = false;
-    if (this.timerID !== null) {
-      clearTimeout(this.timerID);
-      this.timerID = null;
-    }
-    if (this.audioContext.state !== 'closed') {
-      this.audioContext.close();
-    }
-  }
-
-  playNote(freq: number, type: OscillatorType, duration: number, vol: number, attack: number, time: number) {
-    if (this.audioContext.state === 'closed') return;
-    
-    const numOscs = 4;
-    const masterGain = this.audioContext.createGain();
-    masterGain.connect(this.audioContext.destination);
-    
-    const now = time;
-    masterGain.gain.setValueAtTime(0, now);
-    masterGain.gain.linearRampToValueAtTime(vol, now + attack);
-    masterGain.gain.exponentialRampToValueAtTime(0.001, now + duration);
-
-    const delay = this.audioContext.createDelay();
-    delay.delayTime.value = 0.33;
-    const feedback = this.audioContext.createGain();
-    feedback.gain.value = 0.4;
-    delay.connect(feedback);
-    feedback.connect(delay);
-    delay.connect(masterGain);
-
-    for (let i = 0; i < numOscs; i++) {
-      const osc = this.audioContext.createOscillator();
-      const filter = this.audioContext.createBiquadFilter();
-      
-      osc.type = i % 2 === 0 ? type : 'sine';
-      osc.frequency.value = freq * (1 + (i * 0.008));
-      
-      filter.type = 'lowpass';
-      filter.frequency.value = freq * 2;
-      filter.frequency.linearRampToValueAtTime(freq * 6, now + attack);
-      filter.frequency.linearRampToValueAtTime(freq * 1.5, now + duration);
-      
-      osc.connect(filter);
-      filter.connect(masterGain);
-      filter.connect(delay);
-      
-      osc.start(now);
-      osc.stop(now + duration);
-    }
-  }
-
-  getTempoForVibe(vibe: string): number {
-    if (vibe.includes('tribal') || vibe.includes('rhythmic') || vibe.includes('rock')) return 96;
-    if (vibe.includes('cyberpunk') || vibe.includes('electronic')) return 64;
-    return 42;
-  }
-
-  scheduleNext() {
-    if (!this.isPlaying) return;
-    
-    if (this.audioContext.state === 'suspended') {
-      this.audioContext.resume();
-    }
-    
-    while (this.nextNoteTime < this.audioContext.currentTime + 0.5) {
-      if (this.vibeBlend < 1.0) {
-        this.vibeBlend += 0.02;
-        if (this.vibeBlend > 1.0) this.vibeBlend = 1.0;
-      }
-
-      if (this.vibeBlend < 1.0) {
-        const currentWeight = Math.cos(this.vibeBlend * 0.5 * Math.PI);
-        const targetWeight = Math.sin(this.vibeBlend * 0.5 * Math.PI);
-        this.generateTickForVibe(this.currentVibe, currentWeight, this.nextNoteTime);
-        this.generateTickForVibe(this.targetVibe, targetWeight, this.nextNoteTime);
-      } else {
-        this.generateTickForVibe(this.targetVibe, 1.0, this.nextNoteTime);
-      }
-      
-      const currentTempo = this.getTempoForVibe(this.currentVibe);
-      const targetTempo = this.getTempoForVibe(this.targetVibe);
-      const tempo = currentTempo * (1 - this.vibeBlend) + targetTempo * this.vibeBlend;
-      
-      const secondsPerBeat = 60.0 / tempo;
-      this.nextNoteTime += secondsPerBeat;
-    }
-    
-    this.timerID = window.setTimeout(() => this.scheduleNext(), 50);
-  }
-
-  generateTickForVibe(vibe: string, weight: number, time: number) {
-    if (weight <= 0.01) return;
-    
-    const isCyberpunk = vibe.includes('cyberpunk') || vibe.includes('electronic');
-    const isTribal = vibe.includes('tribal') || vibe.includes('rhythmic') || vibe.includes('happy');
-    const isAcoustic = vibe.includes('acoustic') || vibe.includes('guitar');
-    const isAmbient = vibe.includes('ambient') || vibe.includes('drone');
-    const isSad = vibe.includes('sad') || vibe.includes('melancholy');
-    const isTense = vibe.includes('angry') || vibe.includes('fear') || vibe.includes('disgust');
-    
-    let scale = this.scales.pentatonic;
-    let baseNote = 48; // C3
-    let oscType: OscillatorType = 'sine';
-    let vol = 0.08;
-    let duration = 6.0;
-    let attack = 3.0;
-
-    if (isCyberpunk) {
-      scale = this.scales.cyberpunk;
-      baseNote = 36;
-      oscType = 'sawtooth';
-      vol = 0.04;
-      duration = 4.0;
-      attack = 2.0;
-    } else if (isTribal) {
-      scale = this.scales.tribal;
-      baseNote = 43;
-      oscType = 'square';
-      vol = 0.06;
-      duration = 1.5;
-      attack = 0.1;
-    } else if (isSad) {
-      scale = this.scales.melancholic;
-      baseNote = 48;
-      oscType = 'sine';
-      vol = 0.08;
-      duration = 8.0;
-      attack = 4.0;
-    } else if (isTense) {
-      scale = this.scales.dissonant;
-      baseNote = 36;
-      oscType = 'sawtooth';
-      vol = 0.05;
-      duration = 5.0;
-      attack = 1.5;
-    } else if (isAcoustic) {
-      scale = this.scales.major;
-      baseNote = 48;
-      oscType = 'sine';
-      vol = 0.08;
-      duration = 5.0;
-      attack = 2.0;
-    } else if (isAmbient) {
-      scale = this.scales.drone;
-      baseNote = 36;
-      oscType = 'sine';
-      vol = 0.12;
-      duration = 10.0;
-      attack = 5.0;
-    }
-
-    vol *= weight;
-
-    if (Math.random() > 0.2) {
-      const noteIndex = scale[Math.floor(Math.random() * scale.length)];
-      const freq = 440 * Math.pow(2, (baseNote + noteIndex - 69) / 12);
-      this.playNote(freq, oscType, duration, vol, attack, time);
-    }
-    
-    if (Math.random() > 0.5) {
-      const bassFreq = 440 * Math.pow(2, (baseNote - 12 - 69) / 12);
-      this.playNote(bassFreq, 'sine', duration * 2, vol * 1.5, attack * 2, time);
-    }
-  }
-}
-
-const VIBE_MAP: Record<string, string> = {
-  person: "ethereal ambient drone, calm",
-  'cell phone': "cyberpunk synthwave, electronic",
-  laptop: "cyberpunk synthwave, electronic",
-  tv: "cyberpunk synthwave, electronic",
-  cup: "coffee shop jazz, chill acoustic",
-  bottle: "coffee shop jazz, chill acoustic",
-  bowl: "coffee shop jazz, chill acoustic",
-  cat: "playful acoustic guitar, happy melody",
-  dog: "playful acoustic guitar, happy melody",
-  bird: "playful acoustic guitar, happy melody",
-  car: "driving rock beat, fast tempo",
-  bus: "driving rock beat, fast tempo",
-  truck: "driving rock beat, fast tempo",
-  chair: "ambient drone, relaxing",
-  couch: "ambient drone, relaxing",
-  bed: "ambient drone, relaxing",
-  'potted plant': "ethereal flute, ambient nature",
-  book: "classical piano, focused",
-};
-
-function getVibeForObjects(objects: string[]) {
-  if (objects.length === 0) return "minimalist ambient drone, quiet";
-  
-  const vibes = new Set<string>();
-  for (const obj of objects) {
-    if (VIBE_MAP[obj]) {
-      vibes.add(VIBE_MAP[obj]);
-    } else {
-      vibes.add("chill lofi beat");
-    }
-  }
-  
-  return Array.from(vibes).slice(0, 2).join(", ");
-}
-
-const getVibeFromGemini = async (objects: string[], emotion: string): Promise<string> => {
+const getSceneAnalysisFromGemini = async (objects: string[], emotion: string): Promise<string> => {
   try {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY });
-    const prompt = `You are a soundscape generator. Based on the following scene, output a 3-5 word ambient soundscape description (e.g., 'tribal rhythmic drone', 'cyberpunk electronic drone' or 'melancholy acoustic ambient'). Do not include any other text. Never output 'pop', 'upbeat', or 'energetic'. Everything must be ambient, but based on the expression. Scene: A person is feeling ${emotion} and the following objects are visible: ${objects.length > 0 ? objects.join(', ') : 'none'}.`;
+    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+    if (!apiKey || apiKey === 'dummy-key') {
+      return getLocalSceneDescription(objects, emotion);
+    }
+    const ai = new GoogleGenAI({ apiKey });
+    const prompt = `أنت نظام رؤية حاسوبية ومحلل ذكي للمشاهد. بناءً على العناصر المكتشفة: [${objects.length > 0 ? objects.join(', ') : 'لا توجد عناصر'}] وحالة الشخص: [${emotion}]، صف طبيعة المشهد والنشاط الحالي بجملة واحدة ذكية وبليغة ومختصرة باللغة العربية (أقل من 12 كلمة). لا تذكر أي أصوات أو موسيقى على الإطلاق.`;
     const response = await ai.models.generateContent({
       model: 'gemini-flash-lite-latest',
       contents: prompt,
     });
-    return response.text?.trim() || "ambient drone, relaxing";
+    return response.text?.trim() || getLocalSceneDescription(objects, emotion);
   } catch (e: any) {
-    console.warn("Gemini API error (falling back to local vibe map):", e.message || e);
-    return getVibeForObjects(objects) + `, ${emotion} mood`;
+    return getLocalSceneDescription(objects, emotion);
   }
 };
 
 export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(false);
-  const [status, setStatus] = useState('جاري تحميل نموذج الرؤية الحاسوبية...');
-  const [currentPrompt, setCurrentPrompt] = useState('في انتظار تشغيل الكاميرا...');
+  const [status, setStatus] = useState('جاري تحميل نماذج الرؤية الحاسوبية...');
+  const [sceneDescription, setSceneDescription] = useState('في انتظار تشغيل الكاميرا لبدء التحليل البصري...');
   const [isModelLoaded, setIsModelLoaded] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
@@ -486,45 +169,20 @@ export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const faceCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const sessionRef = useRef<any>(null);
-  const playerRef = useRef<PCMPlayer | null>(null);
-  const proceduralEngineRef = useRef<ProceduralMusicEngine | null>(null);
   
   const objectModelRef = useRef<cocoSsd.ObjectDetection | null>(null);
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
   const isPlayingRef = useRef(false);
-  const lastPromptRef = useRef<string>("");
   const lastStateRef = useRef<string>("");
   const pendingStateRef = useRef<string | null>(null);
-  const vibeTimeoutRef = useRef<any>(null);
+  const analysisTimeoutRef = useRef<any>(null);
   const lastStateUpdateTimeRef = useRef<number>(0);
   const detectLoopRef = useRef<number | null>(null);
   const smoothedBoxesRef = useRef<Map<string, SmoothedBox>>(new Map());
   const smoothedBlendshapesRef = useRef({ smile: 0, frown: 0, mouthOpen: 0, browRaise: 0, eyeBlink: 0, pucker: 0 });
 
-  const playHoverSound = () => {
-    try {
-      initAudio();
-      if (!hoverSynth || Tone.context.state !== 'running') return;
-      
-      const now = Tone.now();
-      hoverSynth.triggerAttackRelease(800, 0.1, now);
-      hoverSynth.frequency.exponentialRampToValueAtTime(1200, now + 0.1);
-    } catch (e) {}
-  };
-
   useEffect(() => {
-    const handleInteraction = () => initAudio();
-    window.addEventListener('click', handleInteraction, { once: true });
-    window.addEventListener('touchstart', handleInteraction, { once: true });
-    return () => {
-      window.removeEventListener('click', handleInteraction);
-      window.removeEventListener('touchstart', handleInteraction);
-    };
-  }, []);
-
-  useEffect(() => {
-    // تحميل نماذج TensorFlow و COCO-SSD و MediaPipe FaceLandmarker
+    // تحميل نماذج TensorFlow و COCO-SSD و MediaPipe FaceLandmarker بدون أي مكتبات صوتية
     const loadModels = async () => {
       try {
         await tf.ready();
@@ -689,7 +347,7 @@ export default function App() {
           // شريط التسمية بالعربية
           ctx.font = '600 11px "Cairo", "JetBrains Mono", sans-serif';
           const textWidth = ctx.measureText(text).width;
-          ctx.fillStyle = `rgba(0, 0, 0, ${opacity * 0.6})`;
+          ctx.fillStyle = `rgba(0, 0, 0, ${opacity * 0.7})`;
           ctx.fillRect(labelX - 4, labelY - 2, textWidth + 14, 20);
           ctx.strokeStyle = `rgba(255, 255, 255, ${opacity * 0.4})`;
           ctx.strokeRect(labelX - 4, labelY - 2, textWidth + 14, 20);
@@ -921,29 +579,17 @@ export default function App() {
         if (stateString !== pendingStateRef.current) {
           pendingStateRef.current = stateString;
           
-          if (vibeTimeoutRef.current) {
-            clearTimeout(vibeTimeoutRef.current);
+          if (analysisTimeoutRef.current) {
+            clearTimeout(analysisTimeoutRef.current);
           }
           
-          vibeTimeoutRef.current = setTimeout(async () => {
+          analysisTimeoutRef.current = setTimeout(async () => {
             if (stateString !== lastStateRef.current) {
               lastStateRef.current = stateString;
-              
-              const newVibe = await getVibeFromGemini(classesArray, currentEmotion);
-              lastPromptRef.current = newVibe;
-              setCurrentPrompt(newVibe);
-              
-              if (proceduralEngineRef.current && proceduralEngineRef.current.isPlaying) {
-                proceduralEngineRef.current.setVibe(newVibe);
-              }
-              
-              if (sessionRef.current) {
-                sessionRef.current.setWeightedPrompts({
-                  weightedPrompts: [{ text: newVibe, weight: 1.0 }]
-                }).catch(console.error);
-              }
+              const newDescription = await getSceneAnalysisFromGemini(classesArray, currentEmotion);
+              setSceneDescription(newDescription);
             }
-          }, 3000);
+          }, 2500);
         }
       } catch (err) {
         console.error("Detection error:", err);
@@ -991,87 +637,13 @@ export default function App() {
         detectLoopRef.current = requestAnimationFrame(runDetection);
       }
 
-      setStatus('جاري الاتصال بالنظام الصوتي...');
-      
-      // تهيئة المحرك الصوتي الإجرائي المحلي كنسخة احتياطية مستمرة ومستقرة
-      if (!proceduralEngineRef.current) {
-        proceduralEngineRef.current = new ProceduralMusicEngine();
-      }
-      
-      const initialPrompt = "minimalist ambient drone, quiet";
-      setCurrentPrompt(initialPrompt);
-      lastPromptRef.current = initialPrompt;
-
-      // محاولة الاتصال بـ Lyria RealTime أولاً، وإذا تعذر الانتقال فوراً للمولد الصوتي المحلي
-      let lyriaConnected = false;
-      const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
-      
-      if (apiKey && apiKey !== 'dummy-key') {
-        try {
-          playerRef.current = new PCMPlayer(48000);
-          const ai = new GoogleGenAI({ 
-            apiKey: apiKey,
-            apiVersion: 'v1alpha'
-          });
-
-          const sessionPromise = ai.live.music.connect({
-            model: "lyria-realtime-exp",
-            callbacks: {
-              onmessage: (message: any) => {
-                const audioChunk = message.audioChunk;
-                if (audioChunk?.data && playerRef.current) {
-                  playerRef.current.playChunk(audioChunk.data);
-                }
-              },
-              onclose: () => {
-                if (isPlayingRef.current && !proceduralEngineRef.current?.isPlaying) {
-                  proceduralEngineRef.current?.start();
-                  setStatus('متصل بمولد الصوت التفاعلي');
-                }
-              },
-              onerror: (err: any) => {
-                console.warn("Lyria error, using procedural audio:", err);
-                if (isPlayingRef.current && !proceduralEngineRef.current?.isPlaying) {
-                  proceduralEngineRef.current?.start();
-                  setStatus('متصل بمولد الصوت التفاعلي');
-                }
-              }
-            }
-          });
-
-          const session = await Promise.race([
-            sessionPromise,
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000))
-          ]) as any;
-
-          if (session) {
-            sessionRef.current = session;
-            lyriaConnected = true;
-            setStatus('متصل ومفعل (محرك Lyria)');
-            setIsPlaying(true);
-            await session.setMusicGenerationConfig({
-              musicGenerationConfig: { bpm: 120, temperature: 1.0 }
-            });
-            await session.setWeightedPrompts({
-              weightedPrompts: [{ text: initialPrompt, weight: 1.0 }]
-            });
-            session.play();
-          }
-        } catch (e) {
-          console.warn("Lyria initialization skipped/fallback:", e);
-        }
-      }
-
-      if (!lyriaConnected) {
-        proceduralEngineRef.current.start();
-        proceduralEngineRef.current.setVibe(initialPrompt);
-        setStatus('متصل ويعمل الآن (المولد الصوتي)');
-        setIsPlaying(true);
-      }
+      setStatus('نظام المسح الذكي نشط ويعمل الآن');
+      setIsPlaying(true);
+      setSceneDescription('جاري رصد وتحليل المشهد والعناصر المحيطة...');
 
     } catch (err: any) {
       console.error("Setup Error:", err);
-      setStatus('فشل الاتصال');
+      setStatus('فشل تشغيل النظام');
       setErrorMsg(err.message || 'حدث خطأ غير متوقع أثناء تشغيل النظام.');
       setInfoMsg(null);
       stopSession(false);
@@ -1080,26 +652,13 @@ export default function App() {
 
   const stopSession = (closeCamera: boolean = true) => {
     setIsPlaying(false);
-    if (vibeTimeoutRef.current) {
-      clearTimeout(vibeTimeoutRef.current);
-      vibeTimeoutRef.current = null;
+    if (analysisTimeoutRef.current) {
+      clearTimeout(analysisTimeoutRef.current);
+      analysisTimeoutRef.current = null;
     }
     pendingStateRef.current = null;
     
     setStatus('في وضع الاستعداد');
-    
-    if (playerRef.current) {
-      playerRef.current.stop();
-      playerRef.current = null;
-    }
-    if (proceduralEngineRef.current) {
-      proceduralEngineRef.current.stop();
-      proceduralEngineRef.current = null;
-    }
-    if (sessionRef.current) {
-      try { sessionRef.current.conn.close(); } catch (e) {}
-      sessionRef.current = null;
-    }
     
     setConsoleState({
       emotion: 'neutral',
@@ -1113,7 +672,7 @@ export default function App() {
 
     if (closeCamera) {
       isPlayingRef.current = false;
-      setCurrentPrompt('في انتظار تشغيل الكاميرا...');
+      setSceneDescription('في انتظار تشغيل الكاميرا لبدء التحليل البصري...');
       
       if (detectLoopRef.current) {
         cancelAnimationFrame(detectLoopRef.current);
@@ -1128,14 +687,6 @@ export default function App() {
     }
   };
 
-  // ترجمة وتنسيق الوصف الصوتي المعروض
-  const getDisplayPrompt = (prompt: string) => {
-    if (VIBE_TRANSLATIONS[prompt]) {
-      return VIBE_TRANSLATIONS[prompt];
-    }
-    return prompt;
-  };
-
   return (
     <div dir="rtl" className="h-[100dvh] w-full bg-black text-white flex overflow-hidden font-sans relative selection:bg-white selection:text-black">
       {/* Background Camera Feed */}
@@ -1144,7 +695,7 @@ export default function App() {
           <div className="absolute inset-0 flex flex-col items-center justify-center text-white/50 z-10 font-mono text-sm gap-2">
             <Camera className="w-10 h-10 mb-2 opacity-50 stroke-[1.5]" />
             <p className="tracking-widest uppercase text-xs font-semibold text-white/70">SUPER_SCAN.CAMERA_OFFLINE</p>
-            <p className="text-xs text-white/40 font-sans">اضغط على زر "بدء تشغيل النظام" لبدء المسح الذكي</p>
+            <p className="text-xs text-white/40 font-sans">اضغط على زر "بدء تشغيل النظام" لتفعيل المسح الذكي الصامت</p>
           </div>
         )}
         <video
@@ -1191,17 +742,16 @@ export default function App() {
                       </h1>
                     </div>
                     <p className="text-[11px] text-white/80 font-mono tracking-wider mt-0.5">
-                      سوبر سكان • محرك الرؤية والتوليد الصوتي v2.4
+                      سوبر سكان • محرك الرؤية الحاسوبية والمسح الذكي v2.4
                     </p>
                   </div>
                   
                   <div className="flex items-center gap-2">
                     {/* زر تشغيل مخصص للهواتف في الوضع الأفقي */}
                     <button
-                      onClick={() => { playHoverSound(); isCameraActive ? stopSession(true) : startSession(); }}
-                      onMouseEnter={playHoverSound}
+                      onClick={() => isCameraActive ? stopSession(true) : startSession()}
                       disabled={!isModelLoaded}
-                      className={`hidden landscape:flex lg:landscape:hidden justify-center items-center gap-2 px-3 py-2 text-[11px] font-bold transition-all duration-300 border backdrop-blur-md ${
+                      className={`hidden landscape:flex lg:landscape:hidden justify-center items-center gap-2 px-3 py-2 text-[11px] font-bold transition-all duration-300 border backdrop-blur-md cursor-pointer ${
                         isCameraActive 
                           ? 'bg-red-500/20 text-red-400 border-red-500 hover:bg-red-500/30 shadow-[0_0_10px_rgba(239,68,68,0.4)]' 
                           : 'bg-white/10 text-white border-white hover:bg-white/20 shadow-[0_0_10px_rgba(255,255,255,0.3)]'
@@ -1218,8 +768,7 @@ export default function App() {
                     
                     {/* زر المعلومات */}
                     <button 
-                      onClick={() => { playHoverSound(); setIsInfoOpen(true); }}
-                      onMouseEnter={playHoverSound}
+                      onClick={() => setIsInfoOpen(true)}
                       className="p-2.5 bg-white/10 hover:bg-white/20 rounded-full transition-colors backdrop-blur-md border border-white/20 shrink-0 text-white cursor-pointer"
                       title="معلومات عن سوبر سكان"
                     >
@@ -1231,7 +780,7 @@ export default function App() {
                 {/* مؤشر حالة النظام */}
                 <div className="text-xs font-mono text-white/90 flex items-center gap-2.5 bg-black/50 backdrop-blur-md px-3.5 py-2 border border-white/20 rounded-none shadow-sm">
                   <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                    status.includes('متصل') || status === 'Connected & Playing' 
+                    status.includes('نشط') || isPlaying 
                       ? 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)] animate-pulse' 
                       : status.includes('جاري') || status.includes('تحميل') 
                       ? 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]' 
@@ -1246,8 +795,7 @@ export default function App() {
               {/* زر تشغيل الموبايل */}
               <div className="flex lg:hidden landscape:hidden flex-col items-stretch gap-4 shrink-0">
                 <button
-                  onClick={() => { playHoverSound(); isCameraActive ? stopSession(true) : startSession(); }}
-                  onMouseEnter={playHoverSound}
+                  onClick={() => isCameraActive ? stopSession(true) : startSession()}
                   disabled={!isModelLoaded}
                   className={`flex justify-center items-center gap-3 px-8 py-3.5 text-sm font-bold tracking-wide transition-all duration-300 border-2 backdrop-blur-md cursor-pointer ${
                     isCameraActive 
@@ -1334,14 +882,13 @@ export default function App() {
             </div>
           </div>
 
-          {/* Left Column in RTL (Top/End: Main Desktop Button, Entities & Audio) */}
+          {/* Left Column in RTL (Top/End: Main Desktop Button, Entities & Scene Analysis) */}
           <div className="contents lg:flex lg:flex-col lg:justify-between lg:items-start w-full lg:w-84 pointer-events-none shrink-0 mt-0">
             
             {/* Top Desktop Controls */}
             <div className="hidden lg:flex flex-col items-start gap-4 shrink-0 order-none pointer-events-auto">
               <button
-                onClick={() => { playHoverSound(); isCameraActive ? stopSession(true) : startSession(); }}
-                onMouseEnter={playHoverSound}
+                onClick={() => isCameraActive ? stopSession(true) : startSession()}
                 disabled={!isModelLoaded}
                 className={`flex justify-center items-center gap-3 px-10 py-4 text-sm font-bold tracking-wider transition-all duration-300 border-2 backdrop-blur-md cursor-pointer ${
                   isCameraActive 
@@ -1359,7 +906,7 @@ export default function App() {
               </button>
             </div>
 
-            {/* Bottom: Entities & Audio Profile */}
+            {/* Bottom: Entities & Scene Analysis */}
             <div className="flex flex-col gap-4 shrink-0 w-full order-2 lg:order-none pointer-events-auto">
               
               {/* بطاقة العناصر المكتشفة */}
@@ -1398,21 +945,16 @@ export default function App() {
                 )}
               </div>
 
-              {/* بطاقة الملف الصوتي */}
-              <div className="w-full bg-black/50 backdrop-blur-md border border-white/20 p-5 shadow-[0_0_30px_rgba(0,0,0,0.8)]" title="الملف الموسيقي المتولد تفاعلياً حسب المشهد والمشاعر">
+              {/* بطاقة تحليل المشهد والبيئة الذكية */}
+              <div className="w-full bg-black/50 backdrop-blur-md border border-white/20 p-5 shadow-[0_0_30px_rgba(0,0,0,0.8)]" title="تحليل بصري ذكي لطبيعة المشهد والنشاط">
                 <h3 className="text-xs font-bold text-white/70 tracking-wider mb-3 flex items-center gap-2">
-                  <Volume2 className="w-4 h-4 text-white/80" />
-                  الملف الصوتي والموسيقي (Audio Profile)
+                  <Eye className="w-4 h-4 text-white/80" />
+                  تحليل المشهد والبيئة الذكية
                 </h3>
                 <div className="relative overflow-hidden pr-3 border-r-2 border-white">
                   <p className="text-xs leading-relaxed text-white/95 font-medium">
-                    {getDisplayPrompt(currentPrompt)}
+                    {sceneDescription}
                   </p>
-                  {currentPrompt !== getDisplayPrompt(currentPrompt) && (
-                    <p className="text-[10px] font-mono text-white/50 mt-1">
-                      {currentPrompt}
-                    </p>
-                  )}
                 </div>
               </div>
 
@@ -1462,26 +1004,6 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      {/* إشعار المعلومات السفلي (Info Toast) */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex flex-col justify-end items-center pointer-events-none z-30 w-[calc(100%-2rem)] sm:w-full max-w-md">
-        <AnimatePresence>
-          {infoMsg && !errorMsg && (
-            <motion.div 
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 20 }}
-              className="bg-black/80 backdrop-blur-md border border-white/30 p-4 flex items-start gap-3 text-white shadow-[0_0_20px_rgba(255,255,255,0.1)] mb-4 w-full text-right"
-            >
-              <Music className="w-5 h-5 shrink-0 mt-0.5 text-white" />
-              <div>
-                <h3 className="font-bold text-sm">{status}</h3>
-                <p className="text-xs mt-1 text-white/80">{infoMsg}</p>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-
       {/* نافذة "عن سوبر سكان" (About Modal) */}
       <AnimatePresence>
         {isInfoOpen && (
@@ -1517,20 +1039,20 @@ export default function App() {
               
               <div className="space-y-4 text-xs sm:text-sm text-white/85 leading-relaxed">
                 <p>
-                  <strong>سوبر سكان (Super Scan)</strong> هو نظام ذكاء اصطناعي متطور للمسح البصري، يدمج بين الرؤية الحاسوبية اللحظية والتوليد الصوتي والموسيقي التفاعلي عبر كاميرا جهازك.
+                  <strong>سوبر سكان (Super Scan)</strong> هو نظام ذكاء اصطناعي متطور للمسح البصري، يدمج بين الرؤية الحاسوبية اللحظية وتحليل المشاعر وتتبع الكائنات عبر كاميرا جهازك في بيئة هادئة بدون أي تشويش صوتي.
                 </p>
                 <p>
-                  يقوم النظام بتحليل تعابير وجهك وتحديد العناصر الموجودة حولك في الوقت الفعلي لتوليد مشهد صوتي مستمر يتناغم مع مشاعرك ومحيطك.
+                  يقوم النظام بتحليل تعابير وجهك وتحديد العناصر الموجودة حولك في الوقت الفعلي لتوفير قراءة ذكية لحالة المشهد وبيئته.
                 </p>
                 <ul className="list-disc pr-5 space-y-2.5 text-white/75 text-xs">
                   <li>
                     <strong className="text-white">المسح الحيوي (Biometric Scan):</strong> يتتبع معالم الوجه (Face Mesh) ونقاط التعابير لاستنتاج حالتك المزاجية (فرح، حزن، مفاجأة، حماس، هدوء...).
                   </li>
                   <li>
-                    <strong className="text-white">التعرف على الكائنات (Entities):</strong> يكتشف الأشياء في محيطك (مثل الهواتف، الحواسيب، الأكواب، الكتب) للتأثير في الإيقاع والآلات الموسيقية.
+                    <strong className="text-white">التعرف على الكائنات (Entities):</strong> يكتشف الأشياء في محيطك (مثل الهواتف، الحواسيب، الأكواب، الكتب) لحظياً.
                   </li>
                   <li>
-                    <strong className="text-white">الملف الصوتي الذكي (Audio Profile):</strong> يبتكر الذكاء الاصطناعي وصفاً صوتياً ديناميكياً يحرك محرك الصوت لإنشاء موسيقى متجددة دائماً.
+                    <strong className="text-white">تحليل المشهد الذكي:</strong> يبتكر الذكاء الاصطناعي وصفاً دقيقاً لطبيعة البيئة الحالية ومجال التركيز.
                   </li>
                 </ul>
                 <div className="p-3 bg-white/5 border border-white/10 text-[11px] text-white/60 mt-4 leading-normal">
